@@ -1,0 +1,152 @@
+using System.Drawing.Imaging;
+using System.Text.Json;
+using System.Security.Cryptography;
+
+namespace TrayPilot;
+
+internal sealed partial class MainForm
+{
+    readonly System.Windows.Forms.Timer webSystemPoll = new() { Interval = 1000 };
+    readonly Dictionary<int, (string Signature, string Image, bool Native)> webSystemImages = new();
+    bool webSystemWorking;
+    bool webSystemReconnecting;
+    string webSystemError = "";
+    (int Hidden, int Forced)? webSystemUndo;
+    (int Hidden, int Forced) webSystemUndoExpected;
+    internal Func<SystemIconsSnapshot>? WebSystemReadForDiagnostics;
+    internal Func<int, int, int, Task<SystemIconsSnapshot>>? WebSystemChangeForDiagnostics;
+    internal Func<bool?, Task<SystemIconsSnapshot>>? WebSystemConnectForDiagnostics;
+    bool WebSystemVisible => webReady && webPresented && webPageActive && webPage == "system";
+
+    SystemIconsSnapshot ReadWebSystemSnapshot() => WebSystemReadForDiagnostics?.Invoke() ?? ReadSystemIconsSnapshot();
+
+    object WebSystemState()
+    {
+        var snapshot = ReadWebSystemSnapshot();
+        if (webSystemReconnecting) snapshot = snapshot with { Connecting = true };
+        if (webSystemUndo.HasValue && (snapshot.Requested, snapshot.ForcedShown) != webSystemUndoExpected) webSystemUndo = null;
+        return new
+        {
+            connected = snapshot.Connected, connecting = snapshot.Connecting, working = webSystemWorking,
+            requested = snapshot.Requested, forcedShown = snapshot.ForcedShown, found = snapshot.Found, hidden = snapshot.Hidden,
+            shared = snapshot.Shared, legacy = snapshot.Legacy, error = webSystemError.Length > 0 ? webSystemError : snapshot.Error,
+            diagnostic = snapshot.Diagnostic, undo = webSystemUndo.HasValue,
+            items = SystemIconCatalog.Items.Select((item, index) =>
+            {
+                var appearance = index < snapshot.Appearances.Length ? snapshot.Appearances[index] : default;
+                var native = index < snapshot.Images.Length ? snapshot.Images[index] : null;
+                var cached = WebSystemImage(item.Mask, appearance, native);
+                return new { bit = item.Mask, name = L.T(item.Name), description = L.T("systemPageDescription" + item.Mask),
+                    group = item.Mask <= 8 ? "common" : item.Mask is 256 or 512 or 2048 ? "taskbar" : "indicators",
+                    state = snapshot.StateKey(item.Mask), status = L.T(snapshot.StateKey(item.Mask)), image = cached.Image,
+                    imageNative = cached.Native };
+            })
+        };
+    }
+
+    (string Signature, string Image, bool Native) WebSystemImage(int mask, (string Text, string Font) appearance, ExplorerIconImage? native)
+    {
+        if (native != null)
+        {
+            string signature = $"native:{native.Width}:{native.Height}:" + Convert.ToHexString(SHA256.HashData(native.Pixels));
+            if (webSystemImages.TryGetValue(mask, out var current) && current.Signature == signature) return current;
+            try
+            {
+                using var bitmap = native.CreateBitmap();
+                if (bitmap != null)
+                {
+                    using var stream = new MemoryStream(); bitmap.Save(stream, ImageFormat.Png);
+                    return webSystemImages[mask] = (signature, "data:image/png;base64," + Convert.ToBase64String(stream.ToArray()), true);
+                }
+            }
+            catch (Exception ex) when (ex is ArgumentException or OutOfMemoryException or System.Runtime.InteropServices.ExternalException)
+            { /* Optional image failure must preserve the original rendering path. */ }
+        }
+        string fallbackSignature = "fallback:" + appearance.Text + "|" + appearance.Font;
+        if (!webSystemImages.TryGetValue(mask, out var cached) || cached.Signature != fallbackSignature)
+        {
+            using var bitmap = SystemIconImages.Create(mask, 64, appearance);
+            using var stream = new MemoryStream(); bitmap.Save(stream, ImageFormat.Png);
+            cached = (fallbackSignature, "data:image/png;base64," + Convert.ToBase64String(stream.ToArray()), false);
+            webSystemImages[mask] = cached;
+        }
+        return cached;
+    }
+
+    void StartWebSystemPage()
+    {
+        systemIconDialogOpen = Visible && WindowState != FormWindowState.Minimized;
+        systemIconSession?.SetAppearanceCapture(systemIconDialogOpen);
+        webSystemPoll.Stop();
+        webSystemPoll.Tick -= PollWebSystem;
+        webSystemPoll.Tick += PollWebSystem;
+        if (systemIconDialogOpen) webSystemPoll.Start();
+        if (initialized && systemIconDialogOpen) _ = EnsureWebSystemConnectedAsync();
+    }
+
+    void PollWebSystem(object? sender, EventArgs e)
+    {
+        if (WebSystemVisible && systemIconDialogOpen && !webSystemWorking) PublishWebState();
+    }
+
+    async Task EnsureWebSystemConnectedAsync()
+    {
+        if (webSystemWorking || systemIconsConnecting || systemIconsChanging || closing || ReadWebSystemSnapshot().Connected) return;
+        webSystemWorking = webSystemReconnecting = true; webSystemError = ""; PublishWebState();
+        try { await ReconnectSystemIconsPageAsync(); }
+        catch (Exception ex) { if (!closing && !IsDisposed) webSystemError = ex.Message; }
+        finally { webSystemWorking = webSystemReconnecting = false; PublishWebState(); }
+    }
+
+    async Task<object?> ExecuteWebSystemCommand(string action, JsonElement root)
+    {
+        if (WebReadOnlyPreview) throw new InvalidOperationException("Read-only preview.");
+        if (!WebSystemVisible || webSystemWorking || systemIconsChanging || systemIconsConnecting) throw new IOException(L.T("ruleOperationBusy"));
+        var before = ReadWebSystemSnapshot();
+        int mask = before.Requested, forcedShown = before.ForcedShown, restore = 0;
+        bool? legacy = null;
+        if (action == "systemToggle")
+        {
+            int bit = root.GetProperty("bit").GetInt32();
+            if (!SystemIconCatalog.Items.Any(item => item.Mask == bit)) throw new InvalidDataException("Unknown system control.");
+            bool show = root.GetProperty("show").GetBoolean();
+            if (!show && (forcedShown & bit) != 0) throw new IOException(L.T("systemForceShowDisableFirst"));
+            mask = show ? mask & ~bit : mask | bit; restore = show ? bit : 0;
+        }
+        else if (action == "systemForceShow")
+        {
+            int bit = root.GetProperty("bit").GetInt32();
+            if (bit is not (256 or 512)) throw new InvalidDataException("Unsupported force-show control.");
+            bool enabled = root.GetProperty("enabled").GetBoolean();
+            if (enabled && (mask & bit) != 0) throw new IOException(L.T("systemForceShowUnhideFirst"));
+            forcedShown = enabled ? forcedShown | bit : forcedShown & ~bit;
+        }
+        else if (action == "systemRestore") { mask = 0; restore = SystemIconCatalog.All; }
+        else if (action == "systemUndo")
+        {
+            if (!webSystemUndo.HasValue || webSystemUndoExpected != (before.Requested, before.ForcedShown)) throw new IOException(L.T("ruleOperationBusy"));
+            (mask, forcedShown) = webSystemUndo.Value; restore = before.Requested & ~mask;
+        }
+        else if (action == "systemScheme") legacy = root.GetProperty("legacy").GetBoolean();
+        else if (action != "systemReconnect") throw new InvalidDataException("Unknown system action.");
+        SystemIconCatalog.ValidateVisibility(mask, forcedShown);
+        bool reconnecting = action is "systemScheme" or "systemReconnect";
+        if (!reconnecting && (!before.Connected || before.Connecting)) throw new IOException(L.T("systemNativeUnavailable"));
+        EnsureUiContext(); busy = true; webForegroundOperation = true; webSystemWorking = true; webSystemReconnecting = reconnecting; webSystemError = ""; PublishWebState();
+        try
+        {
+            var result = reconnecting
+                ? WebSystemConnectForDiagnostics != null ? await WebSystemConnectForDiagnostics(legacy)
+                    : legacy.HasValue ? await ChangeSystemDiscoveryPageAsync(legacy.Value) : await ReconnectSystemIconsPageAsync()
+                : WebSystemChangeForDiagnostics != null ? await WebSystemChangeForDiagnostics(mask, restore, forcedShown) : await ChangeSystemIconsPageAsync(mask, restore, forcedShown);
+            if (!reconnecting)
+            {
+                webSystemUndo = action == "systemUndo" ? null : (before.Requested, before.ForcedShown);
+                webSystemUndoExpected = (result.Requested, result.ForcedShown);
+            }
+            return null;
+        }
+        catch (Exception ex) { webSystemError = ex.Message; throw; }
+        finally { webSystemWorking = webSystemReconnecting = false; webForegroundOperation = false; UpdateTimer(); CompleteOperation(); }
+    }
+}

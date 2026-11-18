@@ -1,0 +1,20 @@
+/app/
+/source/bin/
+/source/obj/
+/source/native/bin/
+/tests/**/bin/
+/tests/**/obj/
+/integration-*/
+/preview-state/
+/preview*.png
+/test-report*.txt
+/*.zip
+/integration-*.error.txt
+
+tests/
+.history/
+artifacts/
+output/
+
+# Codex implementation plans
+/docs/superpowers/
